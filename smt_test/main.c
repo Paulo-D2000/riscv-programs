@@ -5,8 +5,8 @@
 #define ABS(X) ((X) > 0 ? (X) : (-(X)))
 
 // Riscv-Doom Like VGA
-#define WIDTH 320
-#define HEIGHT 200
+#define WIDTH 640
+#define HEIGHT 480
 #define FRAMESIZE (WIDTH*HEIGHT)
 static volatile unsigned int*  VGA_CONTROL_BASE =  (unsigned int* )0x81000000u;
 static volatile unsigned int*  VGA_PALLETE_BASE =  (unsigned int* )0x81010000u;
@@ -21,10 +21,155 @@ static volatile unsigned int* dmaBusy =       (unsigned int*)0x6500000cu;
 static volatile unsigned int* dmaCommit =     (unsigned int*)0x65000010u;
 
 // "FAKE" GPU Interface
-static volatile int*          gpuVertexQueue = (int*)         0x64000000u;
-static volatile unsigned int* gpuVertexSz =    (unsigned int*)0x64001000u;
-static volatile unsigned int* gpuBusy =        (unsigned int*)0x64001004u;
-static volatile unsigned int* gpuCommit =      (unsigned int*)0x64001008u;
+static volatile uint32_t* const REG_RB_BASE  = (volatile uint32_t*)(0x64000000u);
+static volatile uint32_t* const REG_RB_SIZE  = (volatile uint32_t*)(0x64000004u);
+static volatile uint32_t* const REG_RB_RPTR  = (volatile uint32_t*)(0x64000008u);
+static volatile uint32_t* const REG_RB_WPTR  = (volatile uint32_t*)(0x6400000Cu);
+static volatile uint32_t* const REG_STATUS   = (volatile uint32_t*)(0x64000010u);
+
+// Command opcodes (32-bit headers)
+// Format: [8-bit Opcode] [24-bit Count of following words]
+#define CMD_NOP             0x00  // Body: none
+#define CMD_SET_VBO         0x01  // Body: [Addr] [Stride] [Format] (16.16 fixed-point 3D)
+#define CMD_DRAW            0x02  // Body: [VertexCount]
+#define CMD_FENCE           0x03  // Body: [WriteAddress] [WriteValue]
+#define CMD_SET_VERTEX_SHADER    0x04  // Body: [ShaderAddr] [ShaderSize]
+#define CMD_SET_FRAGMENT_SHADER  0x05  // Body: [ShaderAddr] [ShaderSize]
+#define CMD_SET_UNIFORM          0x06  // Body: [UniformID] [Value0] [Value1] [Value2] [Value3]
+#define CMD_SET_UNIFORM_MAT4     0x07  // Body: [UniformID] [16 values]
+#define CMD_SET_TEXTURE          0x08  // Body: [TextureUnit] [TextureAddr] [Width] [Height] [Format]
+#define CMD_CLEAR                0x09  // Body: [ClearFlags] [Color_RGBA]
+
+// Helper to build packet header
+#define PKT_HEADER(op, count) (((op) << 24) | ((count) & 0xFFFFFF))
+
+// Vertex buffer format
+#define VBO_FORMAT_FIXED16_16_3D 0x0
+
+// Uniform IDs
+#define UNIFORM_MODEL_MATRIX      0
+#define UNIFORM_VIEW_MATRIX       1
+#define UNIFORM_PROJ_MATRIX       2
+#define UNIFORM_TIME              3
+#define UNIFORM_LIGHT_POS         4
+#define UNIFORM_CAMERA_POS        5
+
+// Clear flags
+#define CLEAR_COLOR_BUFFER  (1 << 0)
+#define CLEAR_DEPTH_BUFFER  (1 << 1)
+#define CLEAR_STENCIL_BUFFER (1 << 2)
+
+// GPU driver context
+typedef struct {
+    uint32_t* ring_cpu_addr; // CPU-visible ring buffer
+    uint32_t  wptr;          // CPU write pointer (in bytes)
+    uint32_t  mask;          // (size_bytes - 1) for fast wraparound
+} gpu_ctx_t;
+
+// Initialize GPU and ring buffer
+static inline void gpu_init(gpu_ctx_t* ctx, volatile uint32_t* ring_mem, uint32_t ring_size_words) {
+    ctx->ring_cpu_addr = (uint32_t*)ring_mem;
+    ctx->wptr = 0;
+    uint32_t size_bytes = ring_size_words * 4;
+    ctx->mask = size_bytes - 1;  // Bitmask for fast wraparound
+
+    *REG_RB_BASE = (uint32_t)(ring_mem);
+    *REG_RB_SIZE = size_bytes;  // GPU expects bytes
+    *REG_RB_WPTR = 0;
+
+    __sync_synchronize();
+}
+
+// Write a word into the ring buffer
+static inline void emit_word(gpu_ctx_t* ctx, uint32_t word) {
+    uint32_t byte_offset = ctx->wptr & ctx->mask;  // Fast wraparound with bitmask
+    uint32_t word_index = byte_offset >> 2;        // Divide by 4 (shift right 2)
+    ctx->ring_cpu_addr[word_index] = word;
+    ctx->wptr = (ctx->wptr + 4) & ctx->mask;       // Increment and wrap
+}
+
+// Commit CPU commands to GPU
+static inline void gpu_commit(gpu_ctx_t* ctx) {
+    __sync_synchronize();
+    *REG_RB_WPTR = ctx->wptr;  // Already wrapped in emit_word
+}
+
+// Set current vertex buffer
+static inline void cmd_set_vbo(gpu_ctx_t* ctx, uint32_t phys_addr, uint32_t stride_bytes, uint32_t format) {
+    emit_word(ctx, PKT_HEADER(CMD_SET_VBO, 3));
+    emit_word(ctx, (uint32_t)phys_addr);
+    emit_word(ctx, stride_bytes);
+    emit_word(ctx, format);
+}
+
+// Draw call
+static inline void cmd_draw(gpu_ctx_t* ctx, uint32_t vertex_count) {
+    emit_word(ctx, PKT_HEADER(CMD_DRAW, 1));
+    emit_word(ctx, vertex_count);
+}
+
+// Fence command
+static inline void cmd_fence(gpu_ctx_t* ctx, uint32_t fence_addr_phys, uint32_t fence_val) {
+    emit_word(ctx, PKT_HEADER(CMD_FENCE, 2));
+    emit_word(ctx, (uint32_t)fence_addr_phys);
+    emit_word(ctx, fence_val);
+}
+
+// Wait for fence
+static inline void gpu_wait_fence(volatile uint32_t* fence_addr_virt, uint32_t target_val) {
+    while (*fence_addr_virt < target_val) { }
+}
+
+// Set vertex shader program
+static inline void cmd_set_vertex_shader(gpu_ctx_t* ctx, uint32_t shader_addr, uint32_t shader_size) {
+    emit_word(ctx, PKT_HEADER(CMD_SET_VERTEX_SHADER, 2));
+    emit_word(ctx, shader_addr);
+    emit_word(ctx, shader_size);  // Size in bytes
+}
+
+// Set fragment shader program
+static inline void cmd_set_fragment_shader(gpu_ctx_t* ctx, uint32_t shader_addr, uint32_t shader_size) {
+    emit_word(ctx, PKT_HEADER(CMD_SET_FRAGMENT_SHADER, 2));
+    emit_word(ctx, shader_addr);
+    emit_word(ctx, shader_size);
+}
+
+// Set a single vec4 uniform
+static inline void cmd_set_uniform_vec4(gpu_ctx_t* ctx, uint32_t uniform_id, 
+                                        int32_t x, int32_t y, int32_t z, int32_t w) {
+    emit_word(ctx, PKT_HEADER(CMD_SET_UNIFORM, 5));
+    emit_word(ctx, uniform_id);
+    emit_word(ctx, x);
+    emit_word(ctx, y);
+    emit_word(ctx, z);
+    emit_word(ctx, w);
+}
+
+// Set a mat4 uniform (16 values)
+static inline void cmd_set_uniform_mat4(gpu_ctx_t* ctx, uint32_t uniform_id, int32_t* matrix) {
+    emit_word(ctx, PKT_HEADER(CMD_SET_UNIFORM_MAT4, 17));
+    emit_word(ctx, uniform_id);
+    for (int i = 0; i < 16; i++) {
+        emit_word(ctx, matrix[i]);
+    }
+}
+
+// Set texture
+static inline void cmd_set_texture(gpu_ctx_t* ctx, uint32_t texture_unit, 
+                                    uint32_t texture_addr, uint32_t width, uint32_t height) {
+    emit_word(ctx, PKT_HEADER(CMD_SET_TEXTURE, 4));
+    emit_word(ctx, texture_unit);
+    emit_word(ctx, texture_addr);
+    emit_word(ctx, width);
+    emit_word(ctx, height);
+}
+
+// Clear buffers
+static inline void cmd_clear(gpu_ctx_t* ctx, uint32_t clear_flags, uint32_t color_rgba) {
+    emit_word(ctx, PKT_HEADER(CMD_CLEAR, 2));
+    emit_word(ctx, clear_flags);
+    emit_word(ctx, color_rgba);
+}
 
 // Dual FB setup
 static unsigned char* fb0;
@@ -32,6 +177,8 @@ static unsigned char* fb1;
 
 // Riscv-Doom Like UART
 static volatile char* UART_BASE = 0x82000000u;
+
+#define LOG_RENDER 1
 
 // print string to UART
 void _puts(const char* str){
@@ -207,27 +354,116 @@ void triangle_fill(vec2 v0, vec2 v1, vec2 v2, unsigned int color){
     }
 }
 
-void gpu_upload_verts(void* vertices_array, unsigned int size){
+/*
+void gpu_barrier(){
     // wait for gpu not busy
     while(*gpuBusy) {};
+}
+
+void gpu_commit(){
+    *gpuCommit = 1;
+}
+
+void gpu_upload_verts(void* vertices_array, unsigned int size){
+    // wait for gpu not busy
+    gpu_barrier();
 
     // copy vertices
     memcpy((void*)gpuVertexQueue, vertices_array, size);
     *gpuVertexSz = size / 4;
 
-    // commit buffer
-    *gpuCommit = 1;
+    gpu_commit();
 }
+
+void gpu_upload_vs(void* vs_instructions_array, unsigned int size){
+    // wait for gpu not busy
+    gpu_barrier();
+
+    // copy vertices
+    memcpy((void*)gpuVertexShaderQ, vs_instructions_array, size);
+    *gpuVertexShaderSz = size / 4;
+
+    gpu_commit();
+}
+
+
+void gpu_upload_fs(void* fs_instructions_array, unsigned int size){
+    // wait for gpu not busy
+    gpu_barrier();
+
+    // copy vertices
+    memcpy((void*)gpuFragmentShaderQ, fs_instructions_array, size);
+    *gpuFragmentShaderSz = size / 4;
+
+    gpu_commit();
+}
+
+void gpu_upload_data(void* data_array, unsigned int size){
+    // wait for gpu not busy
+    gpu_barrier();
+
+    // copy vertices
+    memcpy((void*)gpuDataQueue, data_array, size);
+    *gpuDataSz = size / 4;
+
+    gpu_commit();
+}
+
+*/
 
 #define ONE (1<<16)
 #define HALF (1<<15)
 #define FIX_MAKE(INT,FRAC) (((int32_t)(INT) << 16) | (FRAC))
-#define MUL(X,Y) ((int32_t)(((int64_t)(X) * (Y)) >> 16))
-#define DIV(X,Y) ((int32_t)(((int64_t)(X) << 16) / (Y)))
+static inline int32_t fix16_mul(int32_t x, int32_t y)
+{
+    int64_t p = (int64_t)x * (int64_t)y;
 
-//#define CUBE
+    // add/sub half for rounding
+    if (p >= 0) p += (1LL << 15);
+    else        p -= (1LL << 15);
+
+    p >>= 16;
+
+    // saturate to int32_t
+    if (p > INT32_MAX) return INT32_MAX;
+    if (p < INT32_MIN) return INT32_MIN;
+
+    return (int32_t)p;
+}
+
+#define MUL(X,Y) fix16_mul((X),(Y))
+
+static inline int32_t fix16_div(int32_t x, int32_t y)
+{
+    if (y == 0)
+        return (x >= 0) ? INT32_MAX : INT32_MIN;
+
+    int64_t num = (int64_t)x << 16;
+
+    int64_t aby = (y >= 0 ? y : -y);
+    int64_t half = aby >> 1;
+
+    // apply rounding based on sign of division result
+    if ((num >= 0 && y >= 0) || (num < 0 && y < 0))
+        num += half;
+    else
+        num -= half;
+
+    int64_t r = num / y;
+
+    // saturate
+    if (r > INT32_MAX) return INT32_MAX;
+    if (r < INT32_MIN) return INT32_MIN;
+
+    return (int32_t)r;
+}
+
+#define DIV(X,Y) fix16_div((X),(Y))
+
+#define CUBE
 #ifdef CUBE
-static const int32_t g_vertex_buffer_data[] = {
+// GPU Shared VBO
+static volatile const int32_t g_vertex_buffer_data[] = {
     -ONE,-ONE,-ONE, // triangle 1 : begin
     -ONE,-ONE, ONE,
     -ONE, ONE, ONE, // triangle 1 : end
@@ -266,7 +502,8 @@ static const int32_t g_vertex_buffer_data[] = {
     ONE,-ONE, ONE
 };
 #else
-static const int32_t g_vertex_buffer_data[] = {
+// GPU Shared VBO
+static volatile const int32_t g_vertex_buffer_data[] = {
      ONE, -ONE, -ONE,
      ONE,  ONE, -ONE,
     -ONE,  ONE, -ONE,
@@ -285,6 +522,7 @@ typedef struct Vec3i
     int32_t x, y , z;
 }Vec3i;
 
+// GPU Shared VBO
 static Vec3i vertices[NVERTS/3] = {0};
 
 typedef int32_t Matrix44i[4][4];
@@ -399,27 +637,45 @@ void testprint(Vec3i vertCamera, Vec3i projectedVert){
     puts("\n");
 }
 
+// Gpu driver
+gpu_ctx_t g_gpu_driver;
+
+// GPU Shared Ring buffer in RAM (CPU writes commands here)
+// MUST be power of 2!
+#define GPU_RING_SIZE 1024
+volatile uint32_t g_gpu_ring_ram[GPU_RING_SIZE] __attribute__((aligned(32)));
+
+// GPU Shared Fence variable
+volatile uint32_t g_gpu_fence_var = 0;
+
+// Random Shared texture
+#define TEX_WIDTH 256
+#define TEX_HEIGH 256
+uint32_t* my_texture[TEX_WIDTH*TEX_HEIGH] = {0};
+
 //#define DBG_VERTS
 void render(void){    
-    puts("Render begin...\n");
+    if(LOG_RENDER) puts("Render begin...\n");
     
     // world transform (model matrix)
     Matrix44i worldToCamera0 = IDENTITY;
     Matrix44i worldToCamera1 = IDENTITY;
 
-    angle = M_PI/4.0f;
+    //angle = M_PI/4.0f;
     worldToCamera0[0][0] = (int32_t)(cos(angle)*(float)ONE);
     worldToCamera0[0][2] = -(int32_t)(sin(angle)*(float)ONE);
     worldToCamera0[2][0] = (int32_t)(sin(angle)*(float)ONE);
     worldToCamera0[2][2] = (int32_t)(cos(angle)*(float)ONE);
 
-    //worldToCamera1[3][0] = 4*ONE;
+    //worldToCamera1[3][0] = FIX_MAKE(2,0); 
     //worldToCamera1[3][1] = 2*ONE;
-    worldToCamera1[3][2] = FIX_MAKE(4,0); 
+    worldToCamera1[3][2] = FIX_MAKE(-4,0); 
 
-    puts("ANGLE: ");
-    put_fixed((int)((180.0f*angle/M_PI) * (float)ONE));
-    puts("\n");
+    if(LOG_RENDER) {
+        puts("ANGLE: ");
+        put_fixed((int)((180.0f*angle/M_PI) * (float)ONE));
+        puts("\n");
+    }
     if(angle >= M_PI/2.0f){
         angle = -M_PI/2.0f;
     }
@@ -481,9 +737,10 @@ void render(void){
         if (projectedVert.x < -ONE || projectedVert.x > ONE|| projectedVert.y < -ONE || projectedVert.y > ONE) continue; 
     
         // convert to raster space and mark the position of the vertex in the image with a simple dot
-        vertices[i/3].x = MIN(WIDTH-1, MAX(0, MUL(WIDTH,  MUL(HALF, ONE + projectedVert.x))));
-        vertices[i/3].y = MIN(HEIGHT-1, MAX(0, MUL(HEIGHT, MUL(HALF, ONE + projectedVert.y))));
-        vertices[i/3].z = MIN(ONE, MAX(-ONE, projectedVert.z));
+        // DISABLED TEST
+        //vertices[i/3].x = MIN(WIDTH-1, MAX(0, MUL(WIDTH,  MUL(HALF, ONE + projectedVert.x))));
+        //vertices[i/3].y = MIN(HEIGHT-1, MAX(0, MUL(HEIGHT, MUL(HALF, ONE + projectedVert.y))));
+        //vertices[i/3].z = MIN(ONE, MAX(-ONE, projectedVert.z));
 #ifdef DBG_VERTS
         puts("BUF Vertex[");
         put_digit(i/3);
@@ -528,12 +785,66 @@ void render(void){
     }
     
     // upload 2d vertices (screen space)
-    gpu_upload_verts(vertices, sizeof(vertices));
+    //gpu_upload_verts(vertices, sizeof(vertices));
+
+    // Reset fence
+    g_gpu_fence_var = 0;
+
+    // Model matrix
+    cmd_set_uniform_mat4(&g_gpu_driver, UNIFORM_MODEL_MATRIX, (int32_t*)worldToCamera0);
+    
+    // View matrix
+    cmd_set_uniform_mat4(&g_gpu_driver, UNIFORM_VIEW_MATRIX, (int32_t*)worldToCamera1);
+    
+    // Projection matrix
+    cmd_set_uniform_mat4(&g_gpu_driver, UNIFORM_PROJ_MATRIX, (int32_t*)Mproj);
+    
+    // Time uniform (for animations)
+    int32_t time = 0;  // 0 for now...
+    cmd_set_uniform_vec4(&g_gpu_driver, UNIFORM_TIME, time, 0, 0, 0);
+    
+    // Light position
+    cmd_set_uniform_vec4(&g_gpu_driver, UNIFORM_LIGHT_POS, 
+                         FIX_MAKE(5,0), FIX_MAKE(10,0), FIX_MAKE(5,0), ONE);
+    
+    // Clear buffers
+    cmd_clear(&g_gpu_driver, CLEAR_COLOR_BUFFER | CLEAR_DEPTH_BUFFER, 0xFF000000);
+
+    // Draw
+    cmd_draw(&g_gpu_driver, NVERTS/3);
+
+    // ----------------------------------------------------
+    // 2. Second cube: farther back + slightly to the left
+    // ----------------------------------------------------
+    Matrix44i far_cube = IDENTITY;
+
+    // Copy current rotation from your spinning cube
+    far_cube[0][0] = worldToCamera0[0][0];
+    far_cube[0][2] = worldToCamera0[0][2];
+    far_cube[2][0] = worldToCamera0[2][0];
+    far_cube[2][2] = worldToCamera0[2][2];
+
+    // Translate it: X = -2.0, Z = -8.0 (much farther back)
+    far_cube[3][0] = FIX_MAKE(-2, 0);   // left
+    far_cube[3][2] = FIX_MAKE(-8, 0);   // far
+
+    cmd_set_uniform_mat4(&g_gpu_driver, UNIFORM_VIEW_MATRIX, (int32_t*)far_cube);
+    cmd_draw(&g_gpu_driver, NVERTS/3);   // <-- second cube
+    // (keep the rest: fence, commit, wait – unchanged)
+    
+    // Fence
+    cmd_fence(&g_gpu_driver, (uint32_t)&g_gpu_fence_var, 1);
+    
+    // Commit
+    gpu_commit(&g_gpu_driver);
+    
+    // Wait
+    gpu_wait_fence(&g_gpu_fence_var, 1);
 
     //delay
     delay(10);
     
-    puts("Render end...\n");
+    if(LOG_RENDER) puts("Render end...\n");
 }
 
 extern void acquire(volatile int32_t* lock);
@@ -706,14 +1017,73 @@ int os_main(){
     }
 }
 
-int main(){
-    fb0 = VGA_SCREEN_0_BASE;
-    fb1 = VGA_SCREEN_1_BASE;
+// VERTEX SHADER
+/*
+attribute vec4 vertexPosition;
 
-    return os_main();
+uniform mat4 modelMatrix;
+uniform mat4 viewMatrix;
+uniform mat4 projectionMatrix;
+
+void main() {
+  gl_Position = projectionMatrix * viewMatrix * modelMatrix * vertexPosition;
+}
+*/
+
+// FRAGMENT SHADER
+/*
+void main() {
+  gl_FragColor = vec4(1.0, 0.0, 0.0, 1.0);
+}
+*/
+
+int main(){
+    // Init only CPU0
+    if (r_mhartid() != 0) {
+        while(1){
+
+        }
+    }
+
+    //fb0 = VGA_SCREEN_0_BASE;
+    //fb1 = VGA_SCREEN_1_BASE;
+
+    //return os_main();
+
+    // Initialize GPU Driver
+    gpu_init(&g_gpu_driver, g_gpu_ring_ram, GPU_RING_SIZE);
+
+    // VERTEX SHADER (Placeholder)
+    static uint32_t vertex_shader[] = {
+        0x00000001,
+        0x00000002
+    };
+    
+    // FRAGMENT SHADER (Placeholder)
+    static uint32_t fragment_shader[] = {
+        0x00000003,
+        0x00000004
+    };
+    
+    // Set VS
+    cmd_set_vertex_shader(&g_gpu_driver, (uint32_t)vertex_shader, sizeof(vertex_shader));
+
+    // Set FS
+    cmd_set_fragment_shader(&g_gpu_driver, (uint32_t)fragment_shader, sizeof(fragment_shader));
+
+    // Set VBO
+    cmd_set_vbo(&g_gpu_driver, (uint32_t)&g_vertex_buffer_data, 3*sizeof(g_vertex_buffer_data[0]), VBO_FORMAT_FIXED16_16_3D);
+
+    // Set texture
+    cmd_set_texture(&g_gpu_driver, 0, (uint32_t)my_texture, TEX_WIDTH, TEX_WIDTH);
+
+    // Commit
+    gpu_commit(&g_gpu_driver);
 
     while(1){
-        //render();
+        render();
+        /*
+        delay(100);
         acquire(&lock);
         delay(100);
         puts("[Core ");
@@ -722,6 +1092,7 @@ int main(){
         delay(100);
         release(&lock);
         delay(100);
+        */
     }
     
     return 0;
